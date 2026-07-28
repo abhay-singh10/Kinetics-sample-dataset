@@ -1,0 +1,228 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# =====================================================================
+# 1. CAUSAL CONVOLUTION WITH STREAM BUFFERING
+# =====================================================================
+class CausalConv3d(nn.Module):
+    """
+    Causal 3D / (2+1)D convolution.
+    Applies padding ONLY to the left (past frames) in the temporal dimension,
+    preserving state buffers across frames during real-time streaming.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, groups=1, bias=False):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding, padding)
+
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.spatial_padding = (padding[1], padding[2])
+
+        # Standard Conv3d operating over temporal and spatial dimensions
+        self.conv = nn.Conv3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=(0, padding[1], padding[2]),
+            groups=groups, bias=bias
+        )
+        self.buffer = None
+
+    def clean_activation_buffers(self):
+        self.buffer = None
+
+    def forward(self, x):
+        # x shape: [Batch, Channels, Time, Height, Width]
+        time_len = x.shape[2]
+        pad_len = self.kernel_size[0] - 1
+
+        if self.buffer is not None and self.buffer.shape[0] == x.shape[0]:
+            # Concatenate saved past frames with incoming current frame
+            x = torch.cat([self.buffer, x], dim=2)
+        else:
+            # First frame in stream: Pad with zeros on the temporal left
+            pad = torch.zeros(
+                x.shape[0], x.shape[1], pad_len, x.shape[3], x.shape[4],
+                device=x.device, dtype=x.dtype
+            )
+            x = torch.cat([pad, x], dim=2)
+
+        # Update stream buffer with the last (kernel_size[0] - 1) frames
+        if pad_len > 0:
+            self.buffer = x[:, :, -pad_len:].detach()
+
+        return self.conv(x)
+
+
+# =====================================================================
+# 2. SQUEEZE-AND-EXCITATION (SE) MODULE
+# =====================================================================
+class TemporalSqueezeExcite(nn.Module):
+    def __init__(self, in_channels, squeezed_channels):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.fc1 = nn.Conv3d(in_channels, squeezed_channels, kernel_size=1)
+        self.fc2 = nn.Conv3d(squeezed_channels, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        scale = self.avg_pool(x)
+        scale = F.swish(self.fc1(scale)) if hasattr(F, 'swish') else F.silu(self.fc1(scale))
+        scale = torch.sigmoid(self.fc2(scale))
+        return x * scale
+
+
+# =====================================================================
+# 3. MOVINET INVERTED BOTTLENECK BLOCK
+# =====================================================================
+class MoViNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, exp_channels, kernel_size, stride, se_ratio=0.25):
+        super().__init__()
+        self.use_residual = (in_channels == out_channels and stride == 1)
+
+        # 1. Expand 1x1x1 Conv
+        self.expand = nn.Sequential(
+            nn.Conv3d(in_channels, exp_channels, kernel_size=1, bias=False),
+            nn.BatchNorm3d(exp_channels),
+            nn.SiLU()
+        )
+
+        # 2. Causal Depthwise Conv
+        padding = (kernel_size[0] // 2, kernel_size[1] // 2, kernel_size[2] // 2)
+        self.depthwise = CausalConv3d(
+            exp_channels, exp_channels, kernel_size,
+            stride=stride, padding=padding, groups=exp_channels, bias=False
+        )
+        self.bn_dw = nn.BatchNorm3d(exp_channels)
+        self.act_dw = nn.SiLU()
+
+        # 3. Squeeze-and-Excitation
+        se_channels = max(1, int(in_channels * se_ratio))
+        self.se = TemporalSqueezeExcite(exp_channels, se_channels)
+
+        # 4. Project 1x1x1 Conv
+        self.project = nn.Sequential(
+            nn.Conv3d(exp_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm3d(out_channels)
+        )
+
+    def forward(self, x):
+        res = x
+        x = self.expand(x)
+        x = self.depthwise(x)
+        x = self.bn_dw(x)
+        x = self.act_dw(x)
+        x = self.se(x)
+        x = self.project(x)
+
+        if self.use_residual:
+            x = x + res
+        return x
+
+
+# =====================================================================
+# 4. MOVINET-A2 FULL STREAMING ARCHITECTURE
+# =====================================================================
+class MoViNetA2Stream(nn.Module):
+    def __init__(self, num_classes=3):
+        super().__init__()
+
+        # Stage 0: Stem Causal Conv
+        self.stage0 = nn.Sequential(
+            CausalConv3d(3, 16, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1), bias=False),
+            nn.BatchNorm3d(16),
+            nn.SiLU()
+        )
+
+        # Stage 1: Basic Inverted Bottlenecks
+        self.stage1 = nn.Sequential(
+            MoViNetBlock(16, 16, exp_channels=40, kernel_size=(1, 3, 3), stride=1),
+            MoViNetBlock(16, 16, exp_channels=40, kernel_size=(3, 3, 3), stride=1)
+        )
+
+        # Stage 2: First Spatiotemporal Aggregation Blocks
+        self.stage2 = nn.Sequential(
+            MoViNetBlock(16, 40, exp_channels=96, kernel_size=(3, 3, 3), stride=(1, 2, 2)),
+            MoViNetBlock(40, 40, exp_channels=120, kernel_size=(3, 3, 3), stride=1),
+            MoViNetBlock(40, 40, exp_channels=120, kernel_size=(3, 3, 3), stride=1)
+        )
+
+        # Stage 3: Spatial Downsampling & Deep Feature Extractors
+        self.stage3 = nn.Sequential(
+            MoViNetBlock(40, 72, exp_channels=240, kernel_size=(5, 3, 3), stride=(1, 2, 2)),
+            MoViNetBlock(72, 72, exp_channels=240, kernel_size=(3, 3, 3), stride=1),
+            MoViNetBlock(72, 72, exp_channels=240, kernel_size=(3, 3, 3), stride=1)
+        )
+
+        # Stage 4: High-Level Temporal Aggregation
+        self.stage4 = nn.Sequential(
+            MoViNetBlock(72, 140, exp_channels=480, kernel_size=(5, 3, 3), stride=(1, 2, 2)),
+            MoViNetBlock(140, 140, exp_channels=480, kernel_size=(3, 3, 3), stride=1),
+            MoViNetBlock(140, 140, exp_channels=480, kernel_size=(3, 3, 3), stride=1)
+        )
+
+        # Stage 5: Final Feature Extractor
+        self.stage5 = nn.Sequential(
+            MoViNetBlock(140, 320, exp_channels=960, kernel_size=(3, 3, 3), stride=1),
+            nn.Conv3d(320, 640, kernel_size=1, bias=False),
+            nn.BatchNorm3d(640),
+            nn.SiLU()
+        )
+
+        # Classifier Head
+        self.pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.classifier = nn.Sequential(
+            nn.Conv3d(640, 640, kernel_size=1),
+            nn.SiLU(),
+            nn.Dropout(p=0.2),
+            nn.Conv3d(640, num_classes, kernel_size=1)
+        )
+
+    def clean_activation_buffers(self):
+        """Recursively clears state buffers across all CausalConv3d submodules."""
+        for m in self.modules():
+            if isinstance(m, CausalConv3d):
+                m.clean_activation_buffers()
+
+    def forward(self, x):
+        # Input shape: [Batch, Channels, Time, Height, Width]
+        x = self.stage0(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.stage5(x)
+
+        x = self.pool(x)
+        x = self.classifier(x)
+        
+        # Flatten [Batch, num_classes, 1, 1, 1] -> [Batch, num_classes]
+        return torch.flatten(x, start_dim=1)
+
+
+# =====================================================================
+# QUICK VERIFICATION SCRIPT
+# =====================================================================
+if __name__ == '__main__':
+    # Initialize model for 3 custom classes
+    model = MoViNetA2Stream(num_classes=3)
+
+    # 1. Verify Parameter Count
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"MoViNet-A2 Stream Parameters: {total_params / 1e6:.2f}M")
+
+    # 2. Test Input Clip Tensor (Batch=2, C=3, Frames=15, H=224, W=224)
+    dummy_clip = torch.randn(2, 3, 15, 224, 224)
+
+    # Clean buffers before pass
+    model.clean_activation_buffers()
+
+    # Forward pass
+    output = model(dummy_clip)
+    print(f"Output shape for 15-frame clip: {output.shape}")  # Should be [2, 3]
+
+    # Clean buffers after pass
+    model.clean_activation_buffers()
