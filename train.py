@@ -1,146 +1,190 @@
 import os
 import glob
-import pandas as pd
+import numpy as np
 from PIL import Image
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
+from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
+from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 # Import your stored model architecture
 from model import build_movinet_a2_stream, ConvBlock3D
 
 
 # ==========================================
-# 1. Multi-Label Frame-based Dataset
+# 1. Label Mapping Configuration
 # ==========================================
 
-class FrameStreamDataset(Dataset):
-    """
-    Dataset that loads pre-cropped 224x224 frame images from clip folders
-    and supports multi-label annotations (e.g. 'punch,walk').
-    """
-    def __init__(self, manifest_csv: str, base_frames_dir: str, class_to_idx: dict, clip_len: int = 15):
-        self.df = pd.read_csv(manifest_csv)
-        self.base_frames_dir = base_frames_dir
-        self.class_to_idx = class_to_idx
-        self.num_classes = len(class_to_idx)
-        self.clip_len = clip_len
+# Map original 8-bit flag positions (0 to 7) to target consolidated class names.
+# Customize this dictionary anytime to merge 2, 3, or more labels together!
+RAW_TO_CONSOLIDATED_MAP = {
+    0: "punch",       # Bit 0 -> "punch"
+    1: "punch",       # Bit 1 -> "punch" (Combines Bit 0 and Bit 1)
+    2: "kick",        # Bit 2 -> "kick"
+    3: "locomotion",  # Bit 3 -> "locomotion"
+    4: "locomotion",  # Bit 4 -> "locomotion" (Combines Bit 3 and Bit 4)
+    5: "other",       # Bit 5 -> "other"
+    6: "other",       # Bit 6 -> "other"
+    7: "other"        # Bit 7 -> "other"
+}
 
-        # Image transformations (Normalized to [0, 1])
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(), # Automatically scales pixels to [0, 1]
-        ])
+# Generate unique target classes and index lookups
+UNIQUE_TARGET_CLASSES = sorted(list(set(RAW_TO_CONSOLIDATED_MAP.values())))
+TARGET_CLASS_TO_IDX = {cls_name: i for i, cls_name in enumerate(UNIQUE_TARGET_CLASSES)}
+NUM_TARGET_CLASSES = len(UNIQUE_TARGET_CLASSES)
+
+
+def parse_binary_flag_target(folder_name: str) -> np.ndarray:
+    """
+    Parses an 8-character binary flag string at the end of a folder name (e.g., '0_150_11000000')
+    and maps it to consolidated target classes using Logical OR.
+    """
+    binary_flag_str = folder_name.split('_')[-1].strip()
+    target_vector = np.zeros(NUM_TARGET_CLASSES, dtype=np.float32)
+
+    for raw_bit_idx, char in enumerate(binary_flag_str):
+        if char == '1' and raw_bit_idx in RAW_TO_CONSOLIDATED_MAP:
+            target_class_name = RAW_TO_CONSOLIDATED_MAP[raw_bit_idx]
+            target_class_idx = TARGET_CLASS_TO_IDX[target_class_name]
+            target_vector[target_class_idx] = 1.0  # Logical OR
+
+    return target_vector
+
+
+# ==========================================
+# 2. Folder-Based Sliding Window Dataset
+# ==========================================
+
+class VideoFolderStreamDataset(Dataset):
+    """
+    Loads pre-cropped 224x224 frame images from video folders, parses binary flags,
+    and generates 15-frame sliding window clips using configurable strides.
+    """
+    def __init__(self, folder_paths: list, clip_len: int = 15, stride: int = 5):
+        self.clip_len = clip_len
+        self.samples = []  # Stores (list_of_15_frame_paths, target_tensor)
+
+        self.transform = transforms.ToTensor()
+
+        for folder_path in folder_paths:
+            folder_name = os.path.basename(folder_path)
+            
+            # Parse 8-bit binary flag into target vector
+            target_vector_np = parse_binary_flag_target(folder_name)
+            target_tensor = torch.from_numpy(target_vector_np)
+
+            # Get sorted frame image paths
+            frame_paths = sorted(
+                glob.glob(os.path.join(folder_path, "*.jpg")) + 
+                glob.glob(os.path.join(folder_path, "*.png"))
+            )
+
+            total_frames = len(frame_paths)
+            if total_frames < clip_len:
+                continue
+
+            # Generate sliding window clips
+            for start_idx in range(0, total_frames - clip_len + 1, stride):
+                window_frames = frame_paths[start_idx : start_idx + clip_len]
+                self.samples.append((window_frames, target_tensor))
 
     def __len__(self):
-        return len(self.df)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        clip_folder = os.path.join(self.base_frames_dir, str(row['clip_folder']))
-        
-        # ----------------------------------------------------
-        # MULTI-LABEL: Parse comma-separated labels
-        # ----------------------------------------------------
-        label_str = str(row['label'])
-        active_labels = [l.strip() for l in label_str.split(',') if l.strip()]
-        
-        # Create Float32 multi-hot binary vector [0.0, 1.0, 0.0, ...]
-        target_vector = torch.zeros(self.num_classes, dtype=torch.float32)
-        for label_name in active_labels:
-            if label_name in self.class_to_idx:
-                target_vector[self.class_to_idx[label_name]] = 1.0
-
-        # Read image files in sorted numerical order
-        frame_paths = sorted(
-            glob.glob(os.path.join(clip_folder, "*.jpg")) + 
-            glob.glob(os.path.join(clip_folder, "*.png"))
-        )
+        frame_paths, target_tensor = self.samples[idx]
 
         frames = []
-        for p in frame_paths[:self.clip_len]:
+        for p in frame_paths:
             img = Image.open(p).convert('RGB')
-            img_tensor = self.transform(img)
-            frames.append(img_tensor)
+            frames.append(self.transform(img))
 
-        # Pad clip with zero tensors if it ends shorter than clip_len
-        while len(frames) < self.clip_len:
-            pad_tensor = torch.zeros(3, 224, 224) if len(frames) == 0 else frames[-1].clone()
-            frames.append(pad_tensor)
-
-        # Stack list of (3, 224, 224) tensors into (3, T, 224, 224) for MoViNet
+        # Stack into shape: (3, T=15, 224, 224)
         video_tensor = torch.stack(frames, dim=1)
-        
-        return video_tensor, target_vector
+        return video_tensor, target_tensor
 
 
 # ==========================================
-# 2. Main Training Execution
+# 3. Main Training Execution
 # ==========================================
 
 def main():
     # ----------------------------------
-    # Configurations & Hyperparameters
+    # Hyperparameters & L40S Settings
     # ----------------------------------
-    MANIFEST_CSV = "train_manifest.csv"
-    FRAMES_DIR = "dataset/frames"
-    BATCH_SIZE = 8
+    DATASET_DIR = "dataset"
+    BATCH_SIZE = 64        # Optimized for L40S GPU (48GB VRAM)
     CLIP_LEN = 15          # 15 frames at 10 FPS = 1.5 seconds clip
+    TRAIN_STRIDE = 5       # Overlapping 5-frame jump for Training
+    VAL_STRIDE = 15        # Non-overlapping 15-frame jump for Validation
     EPOCHS = 15
-    LR_BACKBONE = 1e-4     # Learning rate for unfrozen backbone blocks
-    LR_HEAD = 1e-3         # Learning rate for classification head
-    
+    LR_BACKBONE = 2e-4     # Learning rate for unfrozen backbone blocks
+    LR_HEAD = 2e-3         # Learning rate for classification head
+    NUM_WORKERS = 8        # CPU threads for fast data loading
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
-
-    # Parse unique individual classes from potentially comma-separated labels
-    df_manifest = pd.read_csv(MANIFEST_CSV)
-    raw_labels = df_manifest['label'].dropna().astype(str).tolist()
-    
-    unique_labels_set = set()
-    for row_str in raw_labels:
-        for single_label in row_str.split(','):
-            cleaned = single_label.strip()
-            if cleaned:
-                unique_labels_set.add(cleaned)
-                
-    unique_labels = sorted(list(unique_labels_set))
-    class_to_idx = {label_name: idx for idx, label_name in enumerate(unique_labels)}
-    num_classes = len(unique_labels)
-    
-    print(f"Detected {num_classes} classes: {class_to_idx}")
+    print(f"Target Consolidated Classes ({NUM_TARGET_CLASSES}): {TARGET_CLASS_TO_IDX}")
 
     # ----------------------------------
-    # Data Loader Setup
+    # 1. Discover Folders & Extract Labels
     # ----------------------------------
-    train_dataset = FrameStreamDataset(
-        manifest_csv=MANIFEST_CSV,
-        base_frames_dir=FRAMES_DIR,
-        class_to_idx=class_to_idx,
-        clip_len=CLIP_LEN
-    )
+    all_folder_paths = []
+    folder_targets = []
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
+    for f_name in sorted(os.listdir(DATASET_DIR)):
+        f_path = os.path.join(DATASET_DIR, f_name)
+        if os.path.isdir(f_path):
+            all_folder_paths.append(f_path)
+            folder_targets.append(parse_binary_flag_target(f_name))
+
+    all_folder_paths = np.array(all_folder_paths)
+    folder_targets = np.array(folder_targets)  # Shape: (Num_Folders, NUM_TARGET_CLASSES)
 
     # ----------------------------------
-    # Model Setup & Layer Freezing
+    # 2. Multi-Label Stratified Split (80/20)
+    # ----------------------------------
+    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
+
+    for train_idx, val_idx in msss.split(all_folder_paths, folder_targets):
+        train_folders = all_folder_paths[train_idx].tolist()
+        val_folders = all_folder_paths[val_idx].tolist()
+
+    print(f"\nFolders -> Total: {len(all_folder_paths)} | Train: {len(train_folders)} | Val: {len(val_folders)}")
+
+    # Print Stratification Distribution
+    train_counts = folder_targets[train_idx].sum(axis=0)
+    val_counts = folder_targets[val_idx].sum(axis=0)
+    print("\nClass Balance Check across Splits:")
+    for cls_name, cls_i in TARGET_CLASS_TO_IDX.items():
+        tr_c, va_c = train_counts[cls_i], val_counts[cls_i]
+        print(f"  Class '{cls_name}': Train={int(tr_c)} | Val={int(va_c)}")
+
+    # ----------------------------------
+    # 3. Create Datasets & Loaders
+    # ----------------------------------
+    train_dataset = VideoFolderStreamDataset(train_folders, clip_len=CLIP_LEN, stride=TRAIN_STRIDE)
+    val_dataset = VideoFolderStreamDataset(val_folders, clip_len=CLIP_LEN, stride=VAL_STRIDE)
+
+    print(f"\n15-frame Clips -> Train (Stride {TRAIN_STRIDE}): {len(train_dataset)} | Val (Stride {VAL_STRIDE}): {len(val_dataset)}")
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+    # ----------------------------------
+    # 4. Model Setup & Layer Freezing
     # ----------------------------------
     print("\nInitializing MoViNet-A2 Stream model...")
     model = build_movinet_a2_stream(load_weights=True)
 
-    # Swap final classifier head to match custom dataset class count
+    # Swap classifier head to match consolidated class count
     model.classifier[3] = ConvBlock3D(
         in_planes=2048,
-        out_planes=num_classes,
+        out_planes=NUM_TARGET_CLASSES,
         kernel_size=(1, 1, 1),
         tf_like=True,
         causal=True,
@@ -175,9 +219,8 @@ def main():
     print(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
 
     # ----------------------------------
-    # Optimizer & Loss Function
+    # 5. Optimizer, Loss & Mixed Precision
     # ----------------------------------
-    # MULTI-LABEL: BCEWithLogitsLoss treats each class as an independent binary decision
     criterion = nn.BCEWithLogitsLoss()
 
     optimizer = AdamW([
@@ -185,58 +228,107 @@ def main():
         {'params': model.classifier.parameters(), 'lr': LR_HEAD}
     ], weight_decay=0.01)
 
+    scaler = GradScaler()
+    best_val_loss = float('inf')
+
     # ----------------------------------
-    # Training Loop
+    # 6. Training & Validation Loop
     # ----------------------------------
     print("\nStarting multi-label training loop...")
     for epoch in range(EPOCHS):
+        # --- TRAINING PHASE ---
         model.train()
-        running_loss = 0.0
-        exact_match_correct = 0
-        total_samples = 0
+        train_loss = 0.0
+        train_exact_match = 0
+        train_total = 0
 
         for batch_idx, (videos, labels) in enumerate(train_loader):
             videos = videos.to(device)  # (B, 3, T, 224, 224)
-            labels = labels.to(device)  # (B, Num_Classes) Float32 tensor
+            labels = labels.to(device)  # (B, Num_Classes)
 
-            # Reset streaming state buffers at the start of every clip batch
             model.clean_activation_buffers()
-
             optimizer.zero_grad()
 
-            # Forward pass across sequence
-            outputs = model(videos)  # Raw unnormalized logits (B, Num_Classes)
-            loss = criterion(outputs, labels)
+            # Mixed precision forward pass
+            with autocast():
+                outputs = model(videos)
+                loss = criterion(outputs, labels)
 
-            # Backpropagation
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            # Clean buffers post-backprop
             model.clean_activation_buffers()
 
-            # Metrics
-            running_loss += loss.item() * videos.size(0)
-            
-            # MULTI-LABEL PREDICTIONS: Apply Sigmoid + 0.5 Threshold
+            train_loss += loss.item() * videos.size(0)
             probs = torch.sigmoid(outputs)
             preds = (probs >= 0.5).float()
-            
-            # Exact Match Accuracy: Check if all active classes in sample are predicted correctly
-            exact_match_correct += (preds == labels).all(dim=1).sum().item()
-            total_samples += videos.size(0)
 
-        epoch_loss = running_loss / total_samples
-        epoch_acc = (exact_match_correct / total_samples) * 100.0
+            train_exact_match += (preds == labels).all(dim=1).sum().item()
+            train_total += videos.size(0)
 
-        print(f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] - Loss: {epoch_loss:.4f} | Exact Match Acc: {epoch_acc:.2f}%")
+        # --- VALIDATION PHASE ---
+        model.eval()
+        val_loss = 0.0
+        val_exact_match = 0
+        val_total = 0
 
-    # ----------------------------------
-    # Save Fine-Tuned Checkpoint
-    # ----------------------------------
-    save_path = "movinet_a2_stream_multilabel.pth"
-    torch.save(model.state_dict(), save_path)
-    print(f"\nModel fine-tuning complete! Weights saved to: {save_path}")
+        with torch.no_grad():
+            for videos, labels in val_loader:
+                videos = videos.to(device)
+                labels = labels.to(device)
+
+                model.clean_activation_buffers()
+                with autocast():
+                    outputs = model(videos)
+                    loss = criterion(outputs, labels)
+                model.clean_activation_buffers()
+
+                val_loss += loss.item() * videos.size(0)
+                probs = torch.sigmoid(outputs)
+                preds = (probs >= 0.5).float()
+
+                val_exact_match += (preds == labels).all(dim=1).sum().item()
+                val_total += videos.size(0)
+
+        # Print Epoch Summary
+        tr_l = train_loss / train_total
+        tr_acc = (train_exact_match / train_total) * 100.0
+        va_l = val_loss / val_total
+        va_acc = (val_exact_match / val_total) * 100.0
+
+        print(
+            f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] "
+            f"| Train Loss: {tr_l:.4f} (Acc: {tr_acc:.2f}%) "
+            f"| Val Loss: {va_l:.4f} (Acc: {va_acc:.2f}%)"
+        )
+
+        # --- RICH CHECKPOINT SAVING ---
+        if va_l < best_val_loss:
+            best_val_loss = va_l
+
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': va_l,
+                'val_acc': va_acc,
+                'class_to_idx': TARGET_CLASS_TO_IDX,
+                'raw_to_consolidated_map': RAW_TO_CONSOLIDATED_MAP
+            }
+
+            # 1. Main Best Checkpoint File
+            best_path = "best_movinet_a2_stream_multilabel.pth"
+            torch.save(checkpoint, best_path)
+
+            # 2. Historical Epoch Checkpoint File
+            os.makedirs("checkpoints", exist_ok=True)
+            epoch_path = f"checkpoints/movinet_epoch_{epoch+1:02d}_valloss_{va_l:.4f}.pth"
+            torch.save(checkpoint, epoch_path)
+
+            print(f" --> Saved NEW BEST checkpoint to '{best_path}' (Val Loss: {va_l:.4f})")
+
+    print("\nTraining complete! Best weights and full metadata successfully saved.")
 
 
 if __name__ == "__main__":
