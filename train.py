@@ -1,7 +1,10 @@
 import os
 import glob
+import random
+import logging
 import numpy as np
 from PIL import Image
+from sklearn.metrics import precision_recall_fscore_support
 
 import torch
 import torch.nn as nn
@@ -9,10 +12,39 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
-from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 # Import your stored model architecture
 from model import build_movinet_a2_stream, ConvBlock3D
+
+
+# ==========================================
+# 0. Logger Setup
+# ==========================================
+
+def setup_logger(log_file="training.log"):
+    """
+    Sets up a logger that simultaneously prints to the console
+    and streams to a persistent 'training.log' file on disk.
+    """
+    logger = logging.getLogger("MoViNet_Training")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()  # Prevent duplicate logging handlers
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    # Stream to Console
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+    # Save to File
+    fh = logging.FileHandler(log_file, mode='a')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    return logger
+
+logger = setup_logger()
 
 
 # ==========================================
@@ -20,7 +52,7 @@ from model import build_movinet_a2_stream, ConvBlock3D
 # ==========================================
 
 # Map original 8-bit flag positions (0 to 7) to target consolidated class names.
-# Customize this dictionary anytime to merge 2, 3, or more labels together!
+# Customize this dictionary anytime to merge or ignore labels!
 RAW_TO_CONSOLIDATED_MAP = {
     0: "punch",       # Bit 0 -> "punch"
     1: "punch",       # Bit 1 -> "punch" (Combines Bit 0 and Bit 1)
@@ -56,7 +88,74 @@ def parse_binary_flag_target(folder_name: str) -> np.ndarray:
 
 
 # ==========================================
-# 2. Folder-Based Sliding Window Dataset
+# 2. Pure Python Multi-Label Stratified Splitter
+# ==========================================
+
+def custom_multilabel_stratified_split(folder_paths: list, folder_targets: np.ndarray, test_size: float = 0.20, seed: int = 42):
+    """
+    Pure Python multi-label stratification algorithm (Greedy algorithm).
+    Splits whole video folders into Train/Val while balancing active class ratios
+    without requiring external packages.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    num_folders = len(folder_paths)
+    val_target_count = int(num_folders * test_size)
+    
+    indices = list(range(num_folders))
+    random.shuffle(indices)
+    
+    class_frequencies = folder_targets.sum(axis=0)
+    
+    # Prioritize folders with rarer classes
+    def calculate_rarity(idx):
+        active_classes = np.where(folder_targets[idx] == 1)[0]
+        if len(active_classes) == 0:
+            return 0
+        return sum(1.0 / (class_frequencies[c] + 1e-5) for c in active_classes)
+
+    indices.sort(key=calculate_rarity, reverse=True)
+
+    train_idx, val_idx = [], []
+    train_counts = np.zeros(folder_targets.shape[1])
+    val_counts = np.zeros(folder_targets.shape[1])
+
+    target_val_ratio = test_size
+
+    for idx in indices:
+        target = folder_targets[idx]
+        active_classes = np.where(target == 1)[0]
+
+        if len(val_idx) >= val_target_count:
+            train_idx.append(idx)
+            train_counts += target
+            continue
+
+        train_need = 0.0
+        val_need = 0.0
+
+        for c in active_classes:
+            total_c = train_counts[c] + val_counts[c] + 1e-5
+            current_val_ratio = val_counts[c] / total_c
+            
+            if current_val_ratio < target_val_ratio:
+                val_need += 1.0
+            else:
+                train_need += 1.0
+
+        if val_need > train_need and len(val_idx) < val_target_count:
+            val_idx.append(idx)
+            val_counts += target
+        else:
+            train_idx.append(idx)
+            train_counts += target
+
+    return train_idx, val_idx
+
+
+# ==========================================
+# 3. Folder-Based Sliding Window Dataset
 # ==========================================
 
 class VideoFolderStreamDataset(Dataset):
@@ -109,7 +208,25 @@ class VideoFolderStreamDataset(Dataset):
 
 
 # ==========================================
-# 3. Main Training Execution
+# 4. Metrics Logging Helper
+# ==========================================
+
+def log_per_class_metrics(all_targets: np.ndarray, all_preds: np.ndarray, target_class_to_idx: dict):
+    """
+    Computes and logs Precision, Recall, and F1-Score for every consolidated class.
+    """
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_targets, all_preds, average=None, zero_division=0
+    )
+    
+    logger.info("  --- PER-CLASS VALIDATION BREAKDOWN ---")
+    for cls_name, cls_idx in target_class_to_idx.items():
+        p, r, f = precision[cls_idx], recall[cls_idx], f1[cls_idx]
+        logger.info(f"    Class '{cls_name:<12}': Precision: {p*100:5.2f}% | Recall: {r*100:5.2f}% | F1: {f*100:5.2f}%")
+
+
+# ==========================================
+# 5. Main Training Execution
 # ==========================================
 
 def main():
@@ -127,8 +244,8 @@ def main():
     NUM_WORKERS = 8        # CPU threads for fast data loading
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
-    print(f"Target Consolidated Classes ({NUM_TARGET_CLASSES}): {TARGET_CLASS_TO_IDX}")
+    logger.info(f"Training on device: {device}")
+    logger.info(f"Target Consolidated Classes ({NUM_TARGET_CLASSES}): {TARGET_CLASS_TO_IDX}")
 
     # ----------------------------------
     # 1. Discover Folders & Extract Labels
@@ -146,23 +263,24 @@ def main():
     folder_targets = np.array(folder_targets)  # Shape: (Num_Folders, NUM_TARGET_CLASSES)
 
     # ----------------------------------
-    # 2. Multi-Label Stratified Split (80/20)
+    # 2. Pure Python Stratified Split (80/20)
     # ----------------------------------
-    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
+    train_idx, val_idx = custom_multilabel_stratified_split(
+        all_folder_paths, folder_targets, test_size=0.20, seed=42
+    )
 
-    for train_idx, val_idx in msss.split(all_folder_paths, folder_targets):
-        train_folders = all_folder_paths[train_idx].tolist()
-        val_folders = all_folder_paths[val_idx].tolist()
+    train_folders = all_folder_paths[train_idx].tolist()
+    val_folders = all_folder_paths[val_idx].tolist()
 
-    print(f"\nFolders -> Total: {len(all_folder_paths)} | Train: {len(train_folders)} | Val: {len(val_folders)}")
+    logger.info(f"Folders -> Total: {len(all_folder_paths)} | Train: {len(train_folders)} | Val: {len(val_folders)}")
 
-    # Print Stratification Distribution
+    # Print Stratification Distribution Check
     train_counts = folder_targets[train_idx].sum(axis=0)
     val_counts = folder_targets[val_idx].sum(axis=0)
-    print("\nClass Balance Check across Splits:")
+    logger.info("Class Balance Check across Video Folders:")
     for cls_name, cls_i in TARGET_CLASS_TO_IDX.items():
         tr_c, va_c = train_counts[cls_i], val_counts[cls_i]
-        print(f"  Class '{cls_name}': Train={int(tr_c)} | Val={int(va_c)}")
+        logger.info(f"  Class '{cls_name}': Train Folders={int(tr_c)} | Val Folders={int(va_c)}")
 
     # ----------------------------------
     # 3. Create Datasets & Loaders
@@ -170,7 +288,7 @@ def main():
     train_dataset = VideoFolderStreamDataset(train_folders, clip_len=CLIP_LEN, stride=TRAIN_STRIDE)
     val_dataset = VideoFolderStreamDataset(val_folders, clip_len=CLIP_LEN, stride=VAL_STRIDE)
 
-    print(f"\n15-frame Clips -> Train (Stride {TRAIN_STRIDE}): {len(train_dataset)} | Val (Stride {VAL_STRIDE}): {len(val_dataset)}")
+    logger.info(f"15-frame Clips -> Train (Stride {TRAIN_STRIDE}): {len(train_dataset)} | Val (Stride {VAL_STRIDE}): {len(val_dataset)}")
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
@@ -178,7 +296,7 @@ def main():
     # ----------------------------------
     # 4. Model Setup & Layer Freezing
     # ----------------------------------
-    print("\nInitializing MoViNet-A2 Stream model...")
+    logger.info("Initializing MoViNet-A2 Stream model...")
     model = build_movinet_a2_stream(load_weights=True)
 
     # Swap classifier head to match consolidated class count
@@ -216,7 +334,7 @@ def main():
     # Print summary of trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
 
     # ----------------------------------
     # 5. Optimizer, Loss & Mixed Precision
@@ -234,7 +352,7 @@ def main():
     # ----------------------------------
     # 6. Training & Validation Loop
     # ----------------------------------
-    print("\nStarting multi-label training loop...")
+    logger.info("Starting multi-label training loop...")
     for epoch in range(EPOCHS):
         # --- TRAINING PHASE ---
         model.train()
@@ -273,6 +391,9 @@ def main():
         val_exact_match = 0
         val_total = 0
 
+        val_all_targets = []
+        val_all_preds = []
+
         with torch.no_grad():
             for videos, labels in val_loader:
                 videos = videos.to(device)
@@ -291,17 +412,27 @@ def main():
                 val_exact_match += (preds == labels).all(dim=1).sum().item()
                 val_total += videos.size(0)
 
-        # Print Epoch Summary
+                # Store predictions for detailed per-class metric breakdown
+                val_all_targets.append(labels.cpu().numpy())
+                val_all_preds.append(preds.cpu().numpy())
+
+        # Process Metrics
         tr_l = train_loss / train_total
         tr_acc = (train_exact_match / train_total) * 100.0
         va_l = val_loss / val_total
         va_acc = (val_exact_match / val_total) * 100.0
 
-        print(
+        val_all_targets_np = np.vstack(val_all_targets)
+        val_all_preds_np = np.vstack(val_all_preds)
+
+        logger.info(
             f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] "
-            f"| Train Loss: {tr_l:.4f} (Acc: {tr_acc:.2f}%) "
-            f"| Val Loss: {va_l:.4f} (Acc: {va_acc:.2f}%)"
+            f"| Train Loss: {tr_l:.4f} (Exact Acc: {tr_acc:.2f}%) "
+            f"| Val Loss: {va_l:.4f} (Exact Acc: {va_acc:.2f}%)"
         )
+        
+        # Log Precision, Recall, F1 for every class
+        log_per_class_metrics(val_all_targets_np, val_all_preds_np, TARGET_CLASS_TO_IDX)
 
         # --- RICH CHECKPOINT SAVING ---
         if va_l < best_val_loss:
@@ -312,7 +443,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': va_l,
-                'val_acc': va_acc,
+                'val_exact_acc': va_acc,
                 'class_to_idx': TARGET_CLASS_TO_IDX,
                 'raw_to_consolidated_map': RAW_TO_CONSOLIDATED_MAP
             }
@@ -326,9 +457,9 @@ def main():
             epoch_path = f"checkpoints/movinet_epoch_{epoch+1:02d}_valloss_{va_l:.4f}.pth"
             torch.save(checkpoint, epoch_path)
 
-            print(f" --> Saved NEW BEST checkpoint to '{best_path}' (Val Loss: {va_l:.4f})")
+            logger.info(f"  --> Saved NEW BEST checkpoint to '{best_path}' (Val Loss: {va_l:.4f})\n")
 
-    print("\nTraining complete! Best weights and full metadata successfully saved.")
+    logger.info("Training complete! Best weights, metadata, and full logs successfully saved.")
 
 
 if __name__ == "__main__":
