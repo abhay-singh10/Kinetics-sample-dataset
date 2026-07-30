@@ -4,6 +4,7 @@ import random
 import logging
 import numpy as np
 from PIL import Image
+from collections import defaultdict
 from sklearn.metrics import precision_recall_fscore_support
 
 import torch
@@ -73,7 +74,7 @@ NUM_TARGET_CLASSES = len(UNIQUE_TARGET_CLASSES)
 
 def parse_binary_flag_target(folder_name: str) -> np.ndarray:
     """
-    Parses an 8-character binary flag string at the end of a folder name (e.g., '0_150_11000000')
+    Parses an 8-character binary flag string at the end of a subfolder name (e.g., '0_150_11000000')
     and maps it to consolidated target classes using Logical OR.
     """
     binary_flag_str = folder_name.split('_')[-1].strip()
@@ -89,105 +90,115 @@ def parse_binary_flag_target(folder_name: str) -> np.ndarray:
 
 
 # ==========================================
-# 2. Pure Python Multi-Label Stratified Splitter
+# 2. Clip-Weighted Video-Level Stratified Splitter
 # ==========================================
 
-def custom_multilabel_stratified_split(folder_paths: list, folder_targets: np.ndarray, test_size: float = 0.20, seed: int = 42):
+def clip_weighted_multilabel_stratified_split(parent_video_data: dict, test_size: float = 0.20, seed: int = 42):
     """
-    Pure Python multi-label stratification algorithm (Greedy algorithm).
-    Splits whole video folders into Train/Val while balancing active class ratios
-    without requiring external packages.
+    Greedy multi-label stratification algorithm operating strictly at the PARENT VIDEO level.
+    Guarantees 0% video leakage while balancing target splits by actual estimated CLIP COUNTS
+    rather than just video folder counts.
     """
     random.seed(seed)
     np.random.seed(seed)
 
-    num_folders = len(folder_paths)
-    val_target_count = int(num_folders * test_size)
+    parent_video_names = list(parent_video_data.keys())
+    random.shuffle(parent_video_names)
 
-    indices = list(range(num_folders))
-    random.shuffle(indices)
+    # Compute global total clip counts per class
+    total_class_clip_counts = np.zeros(NUM_TARGET_CLASSES, dtype=np.float64)
+    for v_info in parent_video_data.values():
+        total_class_clip_counts += v_info['clip_counts']
 
-    class_frequencies = folder_targets.sum(axis=0)
-
-    # Prioritize folders with rarer classes
-    def calculate_rarity(idx):
-        active_classes = np.where(folder_targets[idx] == 1)[0]
+    # Sort parent videos by rarity (videos containing rare active classes assigned first)
+    def calculate_rarity(v_name):
+        clip_counts = parent_video_data[v_name]['clip_counts']
+        active_classes = np.where(clip_counts > 0)[0]
         if len(active_classes) == 0:
             return 0
-        return sum(1.0 / (class_frequencies[c] + 1e-5) for c in active_classes)
+        return sum(clip_counts[c] / (total_class_clip_counts[c] + 1e-5) for c in active_classes)
 
-    indices.sort(key=calculate_rarity, reverse=True)
+    parent_video_names.sort(key=calculate_rarity, reverse=True)
 
-    train_idx, val_idx = [], []
-    train_counts = np.zeros(folder_targets.shape[1])
-    val_counts = np.zeros(folder_targets.shape[1])
+    train_videos, val_videos = [], []
+    train_clip_totals = np.zeros(NUM_TARGET_CLASSES, dtype=np.float64)
+    val_clip_totals = np.zeros(NUM_TARGET_CLASSES, dtype=np.float64)
 
-    target_val_ratio = test_size
+    # Calculate total clips per video for capacity tracking
+    total_dataset_clips = sum(v_info['total_clips'] for v_info in parent_video_data.values())
+    val_target_clip_limit = total_dataset_clips * test_size
+    current_val_clips = 0
 
-    for idx in indices:
-        target = folder_targets[idx]
-        active_classes = np.where(target == 1)[0]
+    for v_name in parent_video_names:
+        v_info = parent_video_data[v_name]
+        v_clip_counts = v_info['clip_counts']
+        v_total_clips = v_info['total_clips']
 
-        if len(val_idx) >= val_target_count:
-            train_idx.append(idx)
-            train_counts += target
+        # If validation clip quota is reached, assign remaining videos to training
+        if current_val_clips >= val_target_clip_limit:
+            train_videos.append(v_name)
+            train_clip_totals += v_clip_counts
             continue
 
         train_need = 0.0
         val_need = 0.0
 
+        active_classes = np.where(v_clip_counts > 0)[0]
         for c in active_classes:
-            total_c = train_counts[c] + val_counts[c] + 1e-5
-            current_val_ratio = val_counts[c] / total_c
+            total_c = train_clip_totals[c] + val_clip_totals[c] + 1e-5
+            current_val_ratio = val_clip_totals[c] / total_c
 
-            if current_val_ratio < target_val_ratio:
-                val_need += 1.0
+            if current_val_ratio < test_size:
+                val_need += v_clip_counts[c]
             else:
-                train_need += 1.0
+                train_need += v_clip_counts[c]
 
-        if val_need > train_need and len(val_idx) < val_target_count:
-            val_idx.append(idx)
-            val_counts += target
+        if val_need > train_need and (current_val_clips + v_total_clips) <= (val_target_clip_limit * 1.15):
+            val_videos.append(v_name)
+            val_clip_totals += v_clip_counts
+            current_val_clips += v_total_clips
         else:
-            train_idx.append(idx)
-            train_counts += target
+            train_videos.append(v_name)
+            train_clip_totals += v_clip_counts
 
-    return train_idx, val_idx
+    return train_videos, val_videos, train_clip_totals, val_clip_totals
 
 
 # ==========================================
-# 3. Folder-Based Sliding Window Dataset
+# 3. Subfolder-Bound Sliding Window Dataset
 # ==========================================
 
 class VideoFolderStreamDataset(Dataset):
     """
-    Loads pre-cropped 224x224 frame images from video folders, parses binary flags,
-    and generates 15-frame sliding window clips using configurable strides.
+    Loads pre-cropped 224x224 frame images from assigned parent video subfolders.
+    Safely filters out subfolders with <15 frames and generates 15-frame sliding window
+    clips strictly within subfolder boundaries.
     """
-    def __init__(self, folder_paths: list, clip_len: int = 15, stride: int = 5):
+    def __init__(self, assigned_subfolder_paths: list, clip_len: int = 15, stride: int = 5):
         self.clip_len = clip_len
         self.samples = []  # Stores (list_of_15_frame_paths, target_tensor)
 
         self.transform = transforms.ToTensor()
 
-        for folder_path in folder_paths:
-            folder_name = os.path.basename(folder_path)
+        for subfolder_path in assigned_subfolder_paths:
+            subfolder_name = os.path.basename(subfolder_path)
 
             # Parse 8-bit binary flag into target vector
-            target_vector_np = parse_binary_flag_target(folder_name)
+            target_vector_np = parse_binary_flag_target(subfolder_name)
             target_tensor = torch.from_numpy(target_vector_np)
 
             # Get sorted frame image paths
             frame_paths = sorted(
-                glob.glob(os.path.join(folder_path, "*.jpg")) + 
-                glob.glob(os.path.join(folder_path, "*.png"))
+                glob.glob(os.path.join(subfolder_path, "*.jpg")) + 
+                glob.glob(os.path.join(subfolder_path, "*.png"))
             )
 
             total_frames = len(frame_paths)
+            # HARD REQUIREMENT: Ignore subfolders with fewer than 15 frames
             if total_frames < clip_len:
                 continue
 
-            # Generate sliding window clips
+            # Generate sliding window clips strictly inside this subfolder
             for start_idx in range(0, total_frames - clip_len + 1, stride):
                 window_frames = frame_paths[start_idx : start_idx + clip_len]
                 self.samples.append((window_frames, target_tensor))
@@ -241,8 +252,8 @@ def main():
     VAL_STRIDE = 15        # Non-overlapping 15-frame jump for Validation
     EPOCHS = 25            # Maximum epoch budget with early stopping & scheduler
     PATIENCE = 5           # Early stopping patience
-    LR_BACKBONE = 2e-4     # Learning rate for unfrozen backbone blocks
-    LR_HEAD = 2e-3         # Learning rate for classification head
+    LR_BACKBONE = 5e-5     # Conservative learning rate to preserve pre-trained backbone weights
+    LR_HEAD = 1.5e-3       # Fast convergence rate for newly initialized 4-class head
     NUM_WORKERS = 8        # CPU threads for fast data loading
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,48 +261,93 @@ def main():
     logger.info(f"Target Consolidated Classes ({NUM_TARGET_CLASSES}): {TARGET_CLASS_TO_IDX}")
 
     # ----------------------------------
-    # 1. Discover Folders & Extract Labels
+    # 1. Discover Parent Videos & Subfolders
     # ----------------------------------
-    all_folder_paths = []
-    folder_targets = []
+    # Structure: dataset/Videoname/Subfolder_0_150_flags/
+    parent_video_data = {}
+    
+    logger.info("Scanning dataset hierarchy and estimating subfolder clip weights...")
+    for video_name in sorted(os.listdir(DATASET_DIR)):
+        video_dir = os.path.join(DATASET_DIR, video_name)
+        if not os.path.isdir(video_dir):
+            continue
 
-    for f_name in sorted(os.listdir(DATASET_DIR)):
-        f_path = os.path.join(DATASET_DIR, f_name)
-        if os.path.isdir(f_path):
-            all_folder_paths.append(f_path)
-            folder_targets.append(parse_binary_flag_target(f_name))
+        subfolders_info = []
+        video_class_clip_counts = np.zeros(NUM_TARGET_CLASSES, dtype=np.float64)
+        video_total_clips = 0
 
-    all_folder_paths = np.array(all_folder_paths)
-    folder_targets = np.array(folder_targets)  # Shape: (Num_Folders, NUM_TARGET_CLASSES)
+        for subfolder_name in sorted(os.listdir(video_dir)):
+            subfolder_path = os.path.join(video_dir, subfolder_name)
+            if not os.path.isdir(subfolder_path):
+                continue
+
+            # Count valid frame images
+            frame_paths = (
+                glob.glob(os.path.join(subfolder_path, "*.jpg")) + 
+                glob.glob(os.path.join(subfolder_path, "*.png"))
+            )
+            num_frames = len(frame_paths)
+
+            # Skip subfolders that cannot produce at least one 15-frame clip
+            if num_frames < CLIP_LEN:
+                continue
+
+            target_vector = parse_binary_flag_target(subfolder_name)
+            
+            # Estimate number of training clips this subfolder will produce (using TRAIN_STRIDE)
+            estimated_clips = (num_frames - CLIP_LEN) // TRAIN_STRIDE + 1
+            
+            subfolders_info.append({
+                'path': subfolder_path,
+                'target': target_vector,
+                'estimated_clips': estimated_clips
+            })
+
+            video_class_clip_counts += (target_vector * estimated_clips)
+            video_total_clips += estimated_clips
+
+        if len(subfolders_info) > 0:
+            parent_video_data[video_name] = {
+                'subfolders': subfolders_info,
+                'clip_counts': video_class_clip_counts,
+                'total_clips': video_total_clips
+            }
+
+    logger.info(f"Discovered {len(parent_video_data)} valid parent videos containing suitable frame segments.")
 
     # ----------------------------------
-    # 2. Pure Python Stratified Split (80/20)
+    # 2. Parent Video-Level Stratified Split (80/20)
     # ----------------------------------
-    train_idx, val_idx = custom_multilabel_stratified_split(
-        all_folder_paths, folder_targets, test_size=0.20, seed=42
+    train_video_names, val_video_names, train_clip_totals, val_clip_totals = clip_weighted_multilabel_stratified_split(
+        parent_video_data, test_size=0.20, seed=42
     )
 
-    train_folders = all_folder_paths[train_idx].tolist()
-    val_folders = all_folder_paths[val_idx].tolist()
+    # Collect subfolder paths for train and validation
+    train_subfolders = []
+    for v_name in train_video_names:
+        for sf in parent_video_data[v_name]['subfolders']:
+            train_subfolders.append(sf['path'])
 
-    logger.info(f"Folders -> Total: {len(all_folder_paths)} | Train: {len(train_folders)} | Val: {len(val_folders)}")
+    val_subfolders = []
+    for v_name in val_video_names:
+        for sf in parent_video_data[v_name]['subfolders']:
+            val_subfolders.append(sf['path'])
 
-    # Print Stratification Distribution Check & Compute Class Weightings
-    train_counts = folder_targets[train_idx].sum(axis=0)
-    val_counts = folder_targets[val_idx].sum(axis=0)
-    
-    logger.info("Class Balance Check across Video Folders:")
+    logger.info(f"Parent Videos Split -> Total: {len(parent_video_data)} | Train: {len(train_video_names)} | Val: {len(val_video_names)}")
+    logger.info(f"Subfolders Split    -> Train: {len(train_subfolders)} | Val: {len(val_subfolders)}")
+
+    logger.info("Estimated Clip Distribution Check across Video Splits:")
     for cls_name, cls_i in TARGET_CLASS_TO_IDX.items():
-        tr_c, va_c = train_counts[cls_i], val_counts[cls_i]
-        logger.info(f"  Class '{cls_name}': Train Folders={int(tr_c)} | Val Folders={int(va_c)}")
+        tr_c, va_c = train_clip_totals[cls_i], val_clip_totals[cls_i]
+        logger.info(f"  Class '{cls_name}': Train Est Clips={int(tr_c):,} | Val Est Clips={int(va_c):,}")
 
     # ----------------------------------
     # 3. Create Datasets & Loaders
     # ----------------------------------
-    train_dataset = VideoFolderStreamDataset(train_folders, clip_len=CLIP_LEN, stride=TRAIN_STRIDE)
-    val_dataset = VideoFolderStreamDataset(val_folders, clip_len=CLIP_LEN, stride=VAL_STRIDE)
+    train_dataset = VideoFolderStreamDataset(train_subfolders, clip_len=CLIP_LEN, stride=TRAIN_STRIDE)
+    val_dataset = VideoFolderStreamDataset(val_subfolders, clip_len=CLIP_LEN, stride=VAL_STRIDE)
 
-    logger.info(f"15-frame Clips -> Train (Stride {TRAIN_STRIDE}): {len(train_dataset)} | Val (Stride {VAL_STRIDE}): {len(val_dataset)}")
+    logger.info(f"Actual 15-frame Clips Generated -> Train (Stride {TRAIN_STRIDE}): {len(train_dataset):,} | Val (Stride {VAL_STRIDE}): {len(val_dataset):,}")
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
@@ -342,13 +398,13 @@ def main():
     # ----------------------------------
     # 5. Optimizer, Loss & Scheduler
     # ----------------------------------
-    # Compute positive weights for BCE loss to handle mild class imbalance automatically
-    num_train_folders = len(train_folders)
-    pos_counts = train_counts
-    neg_counts = num_train_folders - pos_counts
+    # Compute dynamic positive weights for BCE loss based on estimated training clip distribution
+    total_train_clips = sum(parent_video_data[v]['total_clips'] for v in train_video_names)
+    pos_counts = train_clip_totals
+    neg_counts = total_train_clips - pos_counts
     pos_weights_np = neg_counts / (pos_counts + 1e-5)
     pos_weights_tensor = torch.tensor(pos_weights_np, dtype=torch.float32).to(device)
-    
+
     logger.info(f"Dynamic BCE Loss pos_weights: {dict(zip(TARGET_CLASS_TO_IDX.keys(), np.round(pos_weights_np, 2)))}")
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights_tensor)
