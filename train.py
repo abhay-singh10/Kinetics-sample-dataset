@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
 
@@ -54,14 +55,14 @@ logger = setup_logger()
 # Map original 8-bit flag positions (0 to 7) to target consolidated class names.
 # Customize this dictionary anytime to merge or ignore labels!
 RAW_TO_CONSOLIDATED_MAP = {
-    0: "punch",       # Bit 0 -> "punch"
-    1: "punch",       # Bit 1 -> "punch" (Combines Bit 0 and Bit 1)
-    2: "kick",        # Bit 2 -> "kick"
-    3: "locomotion",  # Bit 3 -> "locomotion"
-    4: "locomotion",  # Bit 4 -> "locomotion" (Combines Bit 3 and Bit 4)
-    5: "other",       # Bit 5 -> "other"
-    6: "other",       # Bit 6 -> "other"
-    7: "other"        # Bit 7 -> "other"
+    0: "class_A",
+    1: "class_A",
+    2: "class_B",
+    3: "class_B",
+    4: "class_C",
+    5: "class_C",
+    6: "class_D",
+    7: "class_D",
 }
 
 # Generate unique target classes and index lookups
@@ -99,15 +100,15 @@ def custom_multilabel_stratified_split(folder_paths: list, folder_targets: np.nd
     """
     random.seed(seed)
     np.random.seed(seed)
-    
+
     num_folders = len(folder_paths)
     val_target_count = int(num_folders * test_size)
-    
+
     indices = list(range(num_folders))
     random.shuffle(indices)
-    
+
     class_frequencies = folder_targets.sum(axis=0)
-    
+
     # Prioritize folders with rarer classes
     def calculate_rarity(idx):
         active_classes = np.where(folder_targets[idx] == 1)[0]
@@ -138,7 +139,7 @@ def custom_multilabel_stratified_split(folder_paths: list, folder_targets: np.nd
         for c in active_classes:
             total_c = train_counts[c] + val_counts[c] + 1e-5
             current_val_ratio = val_counts[c] / total_c
-            
+
             if current_val_ratio < target_val_ratio:
                 val_need += 1.0
             else:
@@ -171,7 +172,7 @@ class VideoFolderStreamDataset(Dataset):
 
         for folder_path in folder_paths:
             folder_name = os.path.basename(folder_path)
-            
+
             # Parse 8-bit binary flag into target vector
             target_vector_np = parse_binary_flag_target(folder_name)
             target_tensor = torch.from_numpy(target_vector_np)
@@ -218,7 +219,7 @@ def log_per_class_metrics(all_targets: np.ndarray, all_preds: np.ndarray, target
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_targets, all_preds, average=None, zero_division=0
     )
-    
+
     logger.info("  --- PER-CLASS VALIDATION BREAKDOWN ---")
     for cls_name, cls_idx in target_class_to_idx.items():
         p, r, f = precision[cls_idx], recall[cls_idx], f1[cls_idx]
@@ -234,11 +235,12 @@ def main():
     # Hyperparameters & L40S Settings
     # ----------------------------------
     DATASET_DIR = "dataset"
-    BATCH_SIZE = 64        # Optimized for L40S GPU (48GB VRAM)
+    BATCH_SIZE = 32        # Optimized for MoViNet-A2 gradient stability
     CLIP_LEN = 15          # 15 frames at 10 FPS = 1.5 seconds clip
-    TRAIN_STRIDE = 5       # Overlapping 5-frame jump for Training
+    TRAIN_STRIDE = 5       # Overlapping 5-frame jump for Training (~66% overlap)
     VAL_STRIDE = 15        # Non-overlapping 15-frame jump for Validation
-    EPOCHS = 15
+    EPOCHS = 25            # Maximum epoch budget with early stopping & scheduler
+    PATIENCE = 5           # Early stopping patience
     LR_BACKBONE = 2e-4     # Learning rate for unfrozen backbone blocks
     LR_HEAD = 2e-3         # Learning rate for classification head
     NUM_WORKERS = 8        # CPU threads for fast data loading
@@ -274,9 +276,10 @@ def main():
 
     logger.info(f"Folders -> Total: {len(all_folder_paths)} | Train: {len(train_folders)} | Val: {len(val_folders)}")
 
-    # Print Stratification Distribution Check
+    # Print Stratification Distribution Check & Compute Class Weightings
     train_counts = folder_targets[train_idx].sum(axis=0)
     val_counts = folder_targets[val_idx].sum(axis=0)
+    
     logger.info("Class Balance Check across Video Folders:")
     for cls_name, cls_i in TARGET_CLASS_TO_IDX.items():
         tr_c, va_c = train_counts[cls_i], val_counts[cls_i]
@@ -337,17 +340,30 @@ def main():
     logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,}")
 
     # ----------------------------------
-    # 5. Optimizer, Loss & Mixed Precision
+    # 5. Optimizer, Loss & Scheduler
     # ----------------------------------
-    criterion = nn.BCEWithLogitsLoss()
+    # Compute positive weights for BCE loss to handle mild class imbalance automatically
+    num_train_folders = len(train_folders)
+    pos_counts = train_counts
+    neg_counts = num_train_folders - pos_counts
+    pos_weights_np = neg_counts / (pos_counts + 1e-5)
+    pos_weights_tensor = torch.tensor(pos_weights_np, dtype=torch.float32).to(device)
+    
+    logger.info(f"Dynamic BCE Loss pos_weights: {dict(zip(TARGET_CLASS_TO_IDX.keys(), np.round(pos_weights_np, 2)))}")
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights_tensor)
 
     optimizer = AdamW([
         {'params': [p for name, p in model.named_parameters() if 'classifier' not in name and p.requires_grad], 'lr': LR_BACKBONE},
         {'params': model.classifier.parameters(), 'lr': LR_HEAD}
     ], weight_decay=0.01)
 
+    # Learning rate scheduler
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
     scaler = GradScaler()
     best_val_loss = float('inf')
+    patience_counter = 0
 
     # ----------------------------------
     # 6. Training & Validation Loop
@@ -416,6 +432,10 @@ def main():
                 val_all_targets.append(labels.cpu().numpy())
                 val_all_preds.append(preds.cpu().numpy())
 
+        # Step Learning Rate Scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
         # Process Metrics
         tr_l = train_loss / train_total
         tr_acc = (train_exact_match / train_total) * 100.0
@@ -426,17 +446,18 @@ def main():
         val_all_preds_np = np.vstack(val_all_preds)
 
         logger.info(
-            f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] "
+            f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] (LR: {current_lr:.2e}) "
             f"| Train Loss: {tr_l:.4f} (Exact Acc: {tr_acc:.2f}%) "
             f"| Val Loss: {va_l:.4f} (Exact Acc: {va_acc:.2f}%)"
         )
-        
+
         # Log Precision, Recall, F1 for every class
         log_per_class_metrics(val_all_targets_np, val_all_preds_np, TARGET_CLASS_TO_IDX)
 
-        # --- RICH CHECKPOINT SAVING ---
+        # --- RICH CHECKPOINT SAVING & EARLY STOPPING ---
         if va_l < best_val_loss:
             best_val_loss = va_l
+            patience_counter = 0  # Reset patience on improvement
 
             checkpoint = {
                 'epoch': epoch + 1,
@@ -458,6 +479,12 @@ def main():
             torch.save(checkpoint, epoch_path)
 
             logger.info(f"  --> Saved NEW BEST checkpoint to '{best_path}' (Val Loss: {va_l:.4f})\n")
+        else:
+            patience_counter += 1
+            logger.info(f"  --> No val loss improvement for {patience_counter}/{PATIENCE} epochs.\n")
+            if patience_counter >= PATIENCE:
+                logger.info(f"Early stopping triggered at Epoch {epoch+1}! Stopping training.")
+                break
 
     logger.info("Training complete! Best weights, metadata, and full logs successfully saved.")
 
