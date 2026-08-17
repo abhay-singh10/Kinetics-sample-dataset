@@ -1,246 +1,664 @@
-import cv2
-import numpy as np
+import csv
+import time
+from typing import Dict, List, Set
+
+import yt_dlp
 
 
-class ITU1702FrameByFrameDetector:
-    """ITU-R BT.1702-3 / WCAG 2.2 Compliant Photosensitive Epilepsy (PSE) Flicker Detector.
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-    Uses Frame-by-Frame Dual-Threshold Hysteresis with Spatial Pixel-Identity
-    Tracking
-    and Shot-Cut Pre-Segmentation.
+OUTPUT_CSV = "5000_hazard_youtube_links.csv"
+
+TARGET_COUNT = 5000
+
+# Each search returns up to 150 candidates.
+SEARCH_LIMIT = 150
+
+# Only retain videos between 3 and 180 seconds.
+MIN_DURATION = 3
+MAX_DURATION = 180
+
+
+# =============================================================================
+# STRONG TITLE BLACKLIST
+# =============================================================================
+
+TITLE_BLACKLIST = {
+    # -------------------------------------------------------------------------
+    # Medical / educational / commentary
+    # -------------------------------------------------------------------------
+    "doctor",
+    "medical",
+    "medicine",
+    "symptoms",
+    "symptom",
+    "treatment",
+    "therapy",
+    "medication",
+    "cure",
+    "diagnosis",
+    "diagnostic",
+    "epilepsy explained",
+    "seizure explained",
+    "explaining",
+    "explained",
+    "discussion",
+    "interview",
+    "podcast",
+    "talk show",
+    "lecture",
+    "lesson",
+    "class",
+    "course",
+    "education",
+    "educational",
+    "history of",
+    "documentary",
+    "news",
+    "news report",
+    "report",
+    "commentary",
+    "analysis",
+
+    # -------------------------------------------------------------------------
+    # YouTube reaction / vlog content
+    # -------------------------------------------------------------------------
+    "reaction",
+    "reacting",
+    "reacts",
+    "vlog",
+    "daily vlog",
+    "review",
+    "reviewing",
+    "unboxing",
+    "testing my",
+    "my setup",
+    "behind the scenes",
+
+    # -------------------------------------------------------------------------
+    # Video editing / software tutorials
+    # -------------------------------------------------------------------------
+    "tutorial",
+    "how to",
+    "how i",
+    "how do",
+    "guide",
+    "step by step",
+    "for beginners",
+    "beginner",
+    "learn",
+    "tips and tricks",
+    "premiere",
+    "premiere pro",
+    "after effects",
+    "aftereffects",
+    "ae tutorial",
+    "capcut",
+    "davinci",
+    "davinci resolve",
+    "resolve",
+    "final cut",
+    "final cut pro",
+    "alight motion",
+    "photoshop",
+    "preset",
+    "presets",
+    "plugin",
+    "plugins",
+    "template",
+    "templates",
+    "transition",
+    "transitions",
+    "overlay pack",
+    "editing tutorial",
+    "video editing",
+    "greenscreen",
+    "green screen",
+    "lut",
+    "keyframes",
+    "rendering",
+    "render",
+    "effect tutorial",
+    "edit tutorial",
+
+    # -------------------------------------------------------------------------
+    # DIY / electronics / hardware
+    # -------------------------------------------------------------------------
+    "diy",
+    "how to make",
+    "how to build",
+    "how to create",
+    "arduino",
+    "esp32",
+    "esp8266",
+    "raspberry pi",
+    "555 timer",
+    "555",
+    "circuit",
+    "circuits",
+    "breadboard",
+    "schematic",
+    "pcb",
+    "soldering",
+    "wiring",
+    "resistor",
+    "transistor",
+    "electronics",
+    "electronic",
+    "homemade",
+    "homemade strobe",
+    "led strip build",
+    "led build",
+    "hardware build",
+    "engineering",
+
+    # -------------------------------------------------------------------------
+    # Photography / lighting equipment
+    # -------------------------------------------------------------------------
+    "godox",
+    "neewer",
+    "profoto",
+    "speedlight",
+    "flashgun",
+    "softbox",
+    "studio strobe",
+    "lighting setup",
+    "lighting gear",
+    "portrait photography",
+    "camera flash",
+    "camera lighting",
+    "aputure",
+    "trigger",
+    "diffuser",
+    "umbrella",
+    "flash photography",
+
+    # -------------------------------------------------------------------------
+    # Relaxation / audio / non-visual content
+    # -------------------------------------------------------------------------
+    "relaxation",
+    "relax",
+    "sleep",
+    "sleep hypnosis",
+    "meditation",
+    "guided",
+    "hypnosis",
+    "asmr",
+    "audiobook",
+    "soundtrack",
+    "full album",
+    "album",
+    "lofi",
+    "chill",
+    "study music",
+    "sleep music",
+    "white noise",
+
+    # -------------------------------------------------------------------------
+    # Magic / drawing / art
+    # -------------------------------------------------------------------------
+    "drawing",
+    "draw",
+    "painting",
+    "paint",
+    "sketching",
+    "sketch",
+    "art tutorial",
+    "magic trick",
+    "magic reveal",
+    "illusion explained",
+
+    # -------------------------------------------------------------------------
+    # Gaming / long playthrough content
+    # -------------------------------------------------------------------------
+    "gameplay",
+    "playthrough",
+    "longplay",
+    "walkthrough",
+    "game review",
+    "gaming",
+
+    # -------------------------------------------------------------------------
+    # Music / performance terms likely to produce irrelevant videos
+    # -------------------------------------------------------------------------
+    "official music video",
+    "music video",
+    "lyrics",
+    "lyric video",
+    "song",
+    "track",
+    "dj mix",
+    "mix",
+    "full concert",
+    "concert vlog",
+}
+
+
+# =============================================================================
+# SEARCH QUERIES
+# =============================================================================
+
+QUERIES = [
+
+    # -------------------------------------------------------------------------
+    # STROBE / FLICKER / FLASH
+    # -------------------------------------------------------------------------
+
+    'epilepsy warning flashing screen -doctor -podcast -symptoms -treatment -documentary -vlog',
+    'seizure warning strobe light -medical -cure -explaining -review -interview',
+    'photosensitivity warning screen flicker -doctor -diagnosis -reaction',
+    'flash warning strobe effects -tutorial -commentary -vlog',
+    'strobe light visual effect screen test -unboxing -review -setup',
+    'extreme strobe light test screen -unboxing -lighting rig',
+    'high frequency flashing screen visual test -tutorial',
+    'rapid screen flicker test visual hazard -talk',
+    'concert stage strobe visualizer loop -full set -crowd vlog',
+    'nightclub strobe light effects visualizer loop -dj mix -live stream',
+    'lightning storm rapid flashes compilation -documentary -news',
+    'arcade game intense screen flash loop -playthrough -longplay',
+    'vj loop strobe flash abstract visualizer -tutorial',
+    'hardcore flashing lights visual loop -music track -album',
+    'rapid flash visual test screen loop -tutorial -diy',
+    'flashing screen seizure warning loop -premiere -capcut -tutorial',
+    'epilepsy warning strobe loop -tutorial -diy -editing',
+    'strobe visualizer loop flashing screen -tutorial -how',
+    'rapid screen flicker visual test -circuit -arduino -tutorial',
+    '10hz strobe test screen -tutorial -diy -circuit -arduino -build',
+    '15hz flicker visual test screen -circuit -arduino -how -tutorial',
+    '20hz strobe flashing screen test -tutorial -diy',
+    'extreme strobe light screen test -unboxing -lighting -review',
+    'black and white strobe screen loop -tutorial -diy -camera',
+    'vj strobe loop background -preset -pack -tutorial -template',
+    'saturated red flash screen test -tutorial -how -code',
+    'red blue strobe flashing screen loop -police -chase -news -diy',
+    'photosensitivity test flashing screen -doctor -medical -treatment -symptoms',
+
+    # -------------------------------------------------------------------------
+    # COLOR / CHROMATIC FLASHES
+    # -------------------------------------------------------------------------
+
+    'saturated red flash visual test screen -tutorial',
+    'red blue strobe light flashing loop -siren -asmr',
+    'chromatic color flicker visual hazard test -review',
+    'emergency strobe light flash animation loop -police chase -news',
+    'pure red flashing screen seizure warning -doctor -medical',
+    'rgb color swap rapid strobe loop -coding -tutorial',
+    'neon strobe flashing sequence visual loop -diy -how',
+    'cyberpunk flashing neon strobe visualizer -radio -podcast',
+    'laser show rapid strobe visual effects -full concert -vlog',
+    'police strobe flash sequence test -unboxing -review',
+
+    # -------------------------------------------------------------------------
+    # SPIRALS / HYPNOTIC / MOTION ILLUSIONS
+    # -------------------------------------------------------------------------
+
+    'spinning fraser spiral optical illusion loop -drawing -tutorial',
+    'hypnotic spiral rotating animation loop -music -song -sleep -therapy',
+    'dizzy spinning optical illusion video loop -magic trick -tutorial',
+    'hypnotic black and white spiral vortex loop -meditation -relaxation',
+    'fraser spiral motion illusion test -explained -history',
+    'rotating op art visual illusion motion loop -drawing -painting',
+    'vertigo visual distortion motion spiral loop -treatment -cure',
+    'hypnotic swirl spinning visual disorientation -voiceover -guided',
+    'endless spinning spiral motion illusion -asmr -audiobook',
+    'motion aftereffect spiral illusion waterfall loop -lesson -class',
+    'rotating spiral visual illusion loop',
+    'fast spinning spiral optical illusion',
+    'spiral tunnel motion illusion loop',
+    'black white rotating spiral illusion',
+    'rapid rotating pattern visual illusion',
+
+    # -------------------------------------------------------------------------
+    # GRIDS / GEOMETRY / PATTERN GLARE
+    # -------------------------------------------------------------------------
+
+    'scintillating grid optical illusion moving animation -explained',
+    'hermann grid illusion moving animation loop -lesson',
+    'hypnotic moving tunnel animation loop -sleep music -study',
+    'pulsating concentric rings optical illusion loop -drawing -relax',
+    'pattern glare visual stress test grating motion -doctor -symptoms',
+    'high contrast stripe grating moving illusion -exam -treatment',
+    'infinite checkerboard tunnel optical illusion loop -gameplay',
+    'psychedelic optical illusion tunnel moving loop -audiobook',
+    'warp speed optical tunnel visualizer loop -space documentary',
+    'visual stress test moving grating lines -optometry -clinic',
+    'moving high contrast grid visual illusion loop',
+    'pulsating checkerboard visual illusion',
+    'rapid moving stripe pattern visual loop',
+    'concentric circles pulsing illusion loop',
+    'high contrast grating motion visual test',
+
+    # -------------------------------------------------------------------------
+    # SHORTS
+    # -------------------------------------------------------------------------
+
+    '#shorts #epilepsywarning -doctor -podcast -symptoms',
+    '#shorts #seizurewarning -treatment -cure',
+    '#shorts #strobelight -unboxing -review',
+    '#shorts #flashinglights -vlog -reaction',
+    '#shorts #opticalillusion -drawing -tutorial -magic',
+    '#shorts #hypnoticspiral -sleep -meditation',
+    '#shorts #hypnotic -guided -hypnosis session',
+    '#shorts #patternglare -symptoms -clinic',
+    '#shorts #visualstress -diagnosis -optometrist',
+    '#shorts #trippyvisuals -music video -song',
+    '#shorts #mindbendingillusion -magic trick -reveal',
+    '#shorts flashing screen strobe loop',
+    '#shorts rapid flicker visual test',
+    '#shorts spinning optical illusion',
+    '#shorts moving pattern illusion',
+]
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def normalize_title(title: str) -> str:
+    return " ".join((title or "").lower().split())
+
+
+def title_is_valid(title: str) -> bool:
+    """
+    Reject titles that strongly indicate tutorials, commentary,
+    equipment, medical content, music/audio, etc.
+    """
+    title_lower = normalize_title(title)
+
+    for keyword in TITLE_BLACKLIST:
+        if keyword in title_lower:
+            return False
+
+    return True
+
+
+def run_search(query: str) -> List[Dict]:
+    """
+    Search YouTube without downloading video bytes.
+    flat-playlist gives us lightweight candidate entries.
     """
 
-    def __init__(
-        self,
-        fps: float = 30.0,
-        grid_size: tuple = (16, 16),
-        l_max: float = 80.0,  # Peak SDR screen brightness in cd/m^2 (BT.1702 spec)
-        tau_high: float = 20.0,  # cd/m^2 primary flash contrast threshold
-        tau_low: float = 5.0,  # cd/m^2 hysteresis lower bound (noise filter)
-        coverage_thresh: float = 0.25,  # 25% screen area hazard requirement
-        scene_cut_area: float = 0.80,  # >= 80% screen area shift = Hard Scene Cut
-        max_flash_hz: float = 3.0,  # > 3.0 Hz (> 6 transitions/sec) = violation
-    ):
-        self.fps = fps
-        self.grid_rows, self.grid_cols = grid_size
-        self.total_blocks = self.grid_rows * self.grid_cols
-        self.l_max = l_max
-        self.tau_high = tau_high
-        self.tau_low = tau_low
-        self.coverage_thresh = coverage_thresh
-        self.scene_cut_area = scene_cut_area
-        self.max_flash_hz = max_flash_hz
+    search_url = f"ytsearch{SEARCH_LIMIT}:{query}"
 
-        # 1.0 second rolling time window in frames
-        self.window_frames = int(round(fps * 1.0))
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "skip_download": True,
+        "extract_flat": True,
+    }
 
-        # State memory
-        self.prev_brightness = None
-        self.prev_state_mask = None
+    candidates = []
 
-        # Rolling queue storing spatial transition masks: (frame_index, active_pixel_mask)
-        self.transition_history = []
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            result = ydl.extract_info(search_url, download=False)
 
-    def _bgr_to_screen_brightness(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Converts raw BGR frame to relative luminance Y (ITU-R BT.709) and
+        if not result:
+            return candidates
 
-        applies gamma-corrected screen brightness L in cd/m^2.
-        """
-        # Convert BGR to RGB normalized [0, 1]
-        frame_rgb = (
-            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-            / 255.0
-        )
+        for entry in result.get("entries", []) or []:
+            if not entry:
+                continue
 
-        # Relative Luminance Y (BT.709 weighting coefficients)
-        y_lum = (
-            0.2126 * frame_rgb[:, :, 0]
-            + 0.7152 * frame_rgb[:, :, 1]
-            + 0.0722 * frame_rgb[:, :, 2]
-        )
+            video_id = entry.get("id")
+            title = entry.get("title", "")
 
-        # Convert to Screen Brightness (cd/m^2) using CRT/LCD Gamma = 2.2 curve
-        brightness = self.l_max * (y_lum**2.2)
+            if not video_id:
+                continue
 
-        # Spatial downsampling to grid for pixel-group identity tracking & noise reduction
-        grid_brightness = cv2.resize(
-            brightness,
-            (self.grid_cols, self.grid_rows),
-            interpolation=cv2.INTER_AREA,
-        )
-        return grid_brightness
+            # Search results can sometimes contain non-video entries.
+            # We only retain YouTube video IDs.
+            if len(video_id) != 11:
+                continue
 
-    def process_frame(self, frame_bgr: np.ndarray, frame_idx: int) -> dict:
-        """Processes a single frame and updates the temporal state machine."""
-        curr_brightness = self._bgr_to_screen_brightness(frame_bgr)
+            candidates.append({
+                "video_id": video_id,
+                "title": title,
+            })
 
-        if self.prev_brightness is None:
-            self.prev_brightness = curr_brightness
-            self.prev_state_mask = np.zeros_like(curr_brightness, dtype=np.int8)
-            return {
-                "flicker_detected": False,
-                "is_scene_cut": False,
-                "reason": "Warming up initial frame",
-            }
+    except Exception as e:
+        print(f"    Search error: {e}")
 
-        # 1. Compute Differential Brightness Map: D_t(x, y) = L(t) - L(t-1)
-        diff_map = curr_brightness - self.prev_brightness
-        abs_diff = np.abs(diff_map)
-
-        # 2. Shot-Cut Pre-Segmentation Filter
-        # If >= 80% of grid blocks change by >= 20 cd/m^2 in 1 step, it is a hard edit
-        large_change_mask = abs_diff >= self.tau_high
-        change_area_ratio = np.sum(large_change_mask) / self.total_blocks
-
-        if change_area_ratio >= self.scene_cut_area:
-            # Hard edit detected: Reset transition history to avoid false positives across shots
-            self.transition_history.clear()
-            self.prev_brightness = curr_brightness
-            self.prev_state_mask = np.zeros_like(curr_brightness, dtype=np.int8)
-            return {
-                "flicker_detected": False,
-                "is_scene_cut": True,
-                "reason": f"Scene cut detected ({change_area_ratio*100:.1f}% area change)",
-            }
-
-        # 3. Dual-Threshold Hysteresis State Updates
-        curr_state_mask = self.prev_state_mask.copy()
-
-        # Transition to State +1 (Brightening flash phase)
-        curr_state_mask[diff_map >= self.tau_high] = 1
-        # Transition to State -1 (Darkening flash phase)
-        curr_state_mask[diff_map <= -self.tau_high] = -1
-        # Values between -tau_low and +tau_low retain their previous state (hysteresis hold)
-
-        # 4. Identify Valid State Flips (+1 -> -1 or -1 -> +1)
-        state_flipped_mask = (
-            (curr_state_mask != self.prev_state_mask)
-            & (curr_state_mask != 0)
-            & (self.prev_state_mask != 0)
-        )
-
-        # 5. Maintain 1-Second Sliding Transition Queue
-        self.transition_history = [
-            (f_idx, mask)
-            for f_idx, mask in self.transition_history
-            if (frame_idx - f_idx) < self.window_frames
-        ]
-
-        if np.any(state_flipped_mask):
-            self.transition_history.append((frame_idx, state_flipped_mask))
-
-        # 6. Spatial Pixel-Identity Set Intersection (A_t ∩ A_t+1 ∩ ...)
-        if len(self.transition_history) >= 2:
-            persistent_mask = self.transition_history[0][1].copy()
-            for _, mask in self.transition_history[1:]:
-                persistent_mask = np.logical_and(persistent_mask, mask)
-            persistent_coverage = np.sum(persistent_mask) / self.total_blocks
-        else:
-            persistent_coverage = 0.0
-
-        transition_count = len(self.transition_history)
-
-        # 7. Evaluate ITU-R BT.1702 Safety Violation:
-        # Cadence > 3 Hz (> 6 transitions per second) AND spatial area >= 25%
-        flicker_violation = (transition_count > 6) and (
-            persistent_coverage >= self.coverage_thresh
-        )
-
-        # Save current states for next frame iteration
-        self.prev_brightness = curr_brightness
-        self.prev_state_mask = curr_state_mask
-
-        return {
-            "flicker_detected": bool(flicker_violation),
-            "is_scene_cut": False,
-            "persistent_coverage": float(persistent_coverage),
-            "transition_count_1s": int(transition_count),
-        }
+    return candidates
 
 
-def run_pse_flicker_analysis(video_path: str, min_duration_sec: float = 1.0):
-    """Processes a video file, aggregates raw frame violations, filters out short
-
-    micro-spikes under min_duration_sec, and prints a continuous timestamp
-    report.
+def get_video_metadata(video_id: str):
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Error: Unable to open video file '{video_path}'")
-        return
+    Fetch actual video metadata for duration/live validation.
+    This does NOT download the video.
+    """
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_duration = total_frames / fps if fps > 0 else 0.0
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
-    print(f"Analyzing '{video_path}'")
-    print(
-        f"FPS: {fps:.2f} | Total Frames: {total_frames} | Duration:"
-        f" {video_duration:.2f}s"
-    )
-    print(
-        f"Filter Rule: Logging events lasting AT LEAST {min_duration_sec:.1f}s"
-    )
-    print("=" * 65)
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "skip_download": True,
+    }
 
-    detector = ITU1702FrameByFrameDetector(fps=fps)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    frame_idx = 0
-    raw_events = []
-    active_start = None
+        if not info:
+            return None
 
-    # Step 1: Detect raw frame-level contiguous state ranges
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+        return info
+
+    except Exception:
+        return None
+
+
+def is_valid_metadata(info: Dict) -> bool:
+    """
+    Final metadata-level filtering.
+    """
+
+    if not info:
+        return False
+
+    # Reject livestreams / upcoming / live-like content.
+    if info.get("is_live") is True:
+        return False
+
+    live_status = info.get("live_status")
+
+    if live_status in {"is_live", "is_upcoming"}:
+        return False
+
+    duration = info.get("duration")
+
+    if duration is None:
+        return False
+
+    if duration < MIN_DURATION:
+        return False
+
+    if duration > MAX_DURATION:
+        return False
+
+    title = info.get("title", "")
+
+    if not title_is_valid(title):
+        return False
+
+    return True
+
+
+# =============================================================================
+# MAIN EXTRACTION
+# =============================================================================
+
+def run_extraction():
+
+    records = []
+
+    seen_ids: Set[str] = set()
+
+    candidate_ids: Set[str] = set()
+
+    print("=" * 80)
+    print("YOUTUBE HAZARD VIDEO DATASET EXTRACTION")
+    print("=" * 80)
+
+    print(f"Target unique videos : {TARGET_COUNT}")
+    print(f"Search queries       : {len(QUERIES)}")
+    print(f"Results/query        : {SEARCH_LIMIT}")
+    print(f"Duration             : {MIN_DURATION}s - {MAX_DURATION}s")
+    print("=" * 80)
+
+    # -------------------------------------------------------------------------
+    # STEP 1: Search all queries and create a candidate pool
+    # -------------------------------------------------------------------------
+
+    for i, query in enumerate(QUERIES, start=1):
+
+        if len(candidate_ids) >= TARGET_COUNT * 2:
+            print("\nCandidate pool is sufficiently large. Stopping searches.")
             break
 
-        frame_idx += 1
-        result = detector.process_frame(frame, frame_idx)
-        timestamp = frame_idx / fps
-
-        is_flicker = result["flicker_detected"]
-
-        # Track continuous True blocks frame-by-frame
-        if is_flicker and active_start is None:
-            active_start = timestamp
-        elif not is_flicker and active_start is not None:
-            raw_events.append((active_start, timestamp))
-            active_start = None
-
-    # Close any active event at video boundary
-    if active_start is not None:
-        raw_events.append((active_start, video_duration))
-
-    cap.release()
-
-    # Step 2: Filter for events lasting AT LEAST min_duration_sec (e.g., 1.0 second)
-    valid_flicker_events = []
-    for start, end in raw_events:
-        duration = end - start
-        if duration >= min_duration_sec:
-            valid_flicker_events.append((start, end, duration))
-
-    # Step 3: Print Clean Summary Report
-    print("\n" + "=" * 65)
-    print(f"FINAL PSE FLICKER REPORT (Min Event Duration: {min_duration_sec}s)")
-    print("=" * 65)
-
-    if not valid_flicker_events:
-        print("PASS: No sustained flicker events detected in this video.")
-    else:
         print(
-            f"FAIL: Found {len(valid_flicker_events)} sustained flicker"
-            " event(s):\n"
+            f"\n[{i:02d}/{len(QUERIES)}] "
+            f"SEARCH: {query[:90]}"
         )
-        for i, (start, end, duration) in enumerate(valid_flicker_events, 1):
+
+        candidates = run_search(query)
+
+        added = 0
+
+        for candidate in candidates:
+
+            video_id = candidate["video_id"]
+            title = candidate["title"]
+
+            if video_id in candidate_ids:
+                continue
+
+            # Apply cheap title filter first.
+            if not title_is_valid(title):
+                continue
+
+            candidate_ids.add(video_id)
+            added += 1
+
+        print(
+            f"    Search results: {len(candidates)}"
+        )
+
+        print(
+            f"    New candidates: {added}"
+        )
+
+        print(
+            f"    Candidate pool : {len(candidate_ids)}"
+        )
+
+    # -------------------------------------------------------------------------
+    # STEP 2: Fetch metadata and perform accurate validation
+    # -------------------------------------------------------------------------
+
+    print("\n" + "=" * 80)
+    print("VALIDATING CANDIDATES")
+    print("=" * 80)
+
+    total_candidates = len(candidate_ids)
+
+    for index, video_id in enumerate(candidate_ids, start=1):
+
+        if len(records) >= TARGET_COUNT:
+            break
+
+        if index % 25 == 0 or index == 1:
             print(
-                f" Event #{i}: From {start:05.2f}s to {end:05.2f}s  (Duration:"
-                f" {duration:.2f}s)"
+                f"[{index}/{total_candidates}] "
+                f"Accepted: {len(records)}/{TARGET_COUNT}"
             )
+
+        info = get_video_metadata(video_id)
+
+        if not is_valid_metadata(info):
+            continue
+
+        title = info.get("title", "").strip()
+        duration = int(round(info.get("duration", 0)))
+
+        webpage_url = info.get(
+            "webpage_url",
+            f"https://www.youtube.com/watch?v={video_id}"
+        )
+
+        matched_query = info.get(
+            "search_query",
+            ""
+        )
+
+        records.append({
+            "video_id": video_id,
+            "title": title,
+            "duration_sec": duration,
+            "url": webpage_url,
+            "matched_query": matched_query,
+        })
+
+        print(
+            f"    + {len(records):04d} | "
+            f"{duration:3d}s | {title[:80]}"
+        )
+
+    # -------------------------------------------------------------------------
+    # STEP 3: Save CSV
+    # -------------------------------------------------------------------------
+
+    with open(
+        OUTPUT_CSV,
+        "w",
+        newline="",
+        encoding="utf-8-sig"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "video_id",
+                "title",
+                "duration_sec",
+                "url",
+                "matched_query",
+            ]
+        )
+
+        writer.writeheader()
+        writer.writerows(records)
+
+    # -------------------------------------------------------------------------
+    # SUMMARY
+    # -------------------------------------------------------------------------
+
+    print("\n" + "=" * 80)
+    print("EXTRACTION COMPLETE")
+    print("=" * 80)
+
+    print(f"Unique valid videos : {len(records)}")
+    print(f"Target              : {TARGET_COUNT}")
+    print(f"Candidate pool      : {len(candidate_ids)}")
+    print(f"CSV                 : {OUTPUT_CSV}")
+
+    if len(records) < TARGET_COUNT:
+        print(
+            "\nWARNING:"
+            "\nOnly "
+            f"{len(records)} "
+            "valid videos were found."
+            "\nRun again with additional search queries if you need "
+            "more than this."
+        )
+
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    # Change "input_video.mp4" to your target video path
-    # Change min_duration_sec if you want a different minimum threshold (e.g., 0.5s or 1.0s)
-    run_pse_flicker_analysis("input_video.mp4", min_duration_sec=1.0)
+    run_extraction()
